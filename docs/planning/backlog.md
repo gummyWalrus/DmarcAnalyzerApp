@@ -113,7 +113,7 @@ design system.) See the categorized lists below for the full inventory.
       Both topologies then came up clean, plus an upgrade verified as a no-op.
 - [x] (done) **Decided: two workers is not safe, and the limit is now enforced in
       code.** Read the claim path rather than guessing. There is no claim mechanism
-      at all — `QueueWorkerService.cs:213` reads every active source with
+      at all — `QueueWorkerService.cs:396` reads every active source with
       `AsNoTracking()` and iterates, no lease, no ownership column, and repo-wide
       there is no `FOR UPDATE`, `SKIP LOCKED`, advisory lock or CAS anywhere.
       Reports themselves are safe (every insert is `ON CONFLICT DO NOTHING` on a
@@ -125,8 +125,8 @@ design system.) See the categorized lists below for the full inventory.
       `RetentionPurgeService.cs:183` deleting a batch another worker already
       deleted, and a checkpoint that can move *backwards* because
       `MailboxSyncService.cs:209` writes unconditionally with no concurrency token.
-      Every "is it due" gate is an in-memory field (`QueueWorkerService.cs:85`,
-      `:117`, `:150`, `:177`), so two processes share no timer state.
+      Every "is it due" gate is an in-memory field (`QueueWorkerService.cs:123`,
+      `:156`, `:185`, `:212`), so two processes share no timer state.
 
       Also found: `20260402150000_AddMailboxSyncActiveRunUnique` added exactly the
       partial unique index that would guard this, and
@@ -283,15 +283,18 @@ designed and then built differently.** `data-model.md` and the newer ops docs
 are accurate; the older planning docs are not, and they are what a new
 contributor reads first.
 
-### `architecture.md` — five drift items, two of them now fixed
+### `architecture.md` — five drift items, three of them now fixed
 
-- [ ] (todo) **§7 documents a DB-backed job queue** (`job_type`, `payload`,
+- [x] (done) **§7 documented a DB-backed job queue** (`job_type`, `payload`,
       `attempt_count`, `locked_by`, dead-letter states, backoff). There is no
       job entity and no job table among the 17 `DbSet`s;
-      `QueueWorkerService.cs:213` reads active sources and iterates in-process.
+      `QueueWorkerService.cs:396` reads active sources and iterates in-process.
       ADR 0008 states it plainly — "there is no claim path" — and
-      `data-model.md:320` already records the truth. The class name is the only
-      surviving trace of the decision.
+      `data-model.md:499` already records the truth. §7 now describes the
+      interval loop, the in-memory gates, `WorkerSingleInstanceLock` and
+      `ON CONFLICT DO NOTHING` dedup, and the queue and CronJob claims in §2, §3,
+      §4 and §6 are corrected. ADR 0002 is marked partially superseded by 0008.
+      The class name is the only surviving trace of the decision.
 - [x] (done) **§5 listed 20 entities; 12 did not exist** — eight were never
       created (`mailbox_source_client`, `sync_checkpoint`, `raw_report`,
       `alert_rule`, `digest_schedule`, `export_job`, `magic_link_nonce`,

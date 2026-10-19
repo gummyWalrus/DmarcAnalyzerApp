@@ -149,7 +149,9 @@ the build.
 The open question here — whether two workers may run concurrently — has been
 answered by reading the claim path. **There is no claim path.** The worker reads
 every active mailbox source and iterates; there is no lease, no ownership column,
-and no `FOR UPDATE`, `SKIP LOCKED` or advisory lock anywhere in the codebase.
+and, when this was written, no `FOR UPDATE`, `SKIP LOCKED` or advisory lock
+anywhere in the codebase. The advisory lock described below is the one that has
+since been added.
 
 Reports survive a second worker: every insert is `ON CONFLICT DO NOTHING` against
 a real unique index, and the loser is detected by affected-row count rather than

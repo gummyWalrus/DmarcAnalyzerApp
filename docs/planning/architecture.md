@@ -17,8 +17,8 @@ Technical architecture for `DmarcAnalyzerApp` MVP and near-term post-MVP evoluti
 - Frontend: React + TypeScript + Vite.
 - Data store: PostgreSQL (EF Core + Npgsql).
 - Scheduling: global polling interval, every 60 minutes, 24/7.
-- Background execution: lightweight DB-backed queue + hosted worker mode.
-- Kubernetes execution: CronJob-triggered worker runs.
+- Background execution: one in-process interval loop (`QueueWorkerService`) in worker mode, no job queue (§7).
+- Kubernetes execution: the worker is a `Deployment` pinned to one replica, not a CronJob (ADR 0008).
 - Compose execution: single image dual mode (API mode and worker mode by env/config).
 - Mailbox support (MVP): IMAP + POP3, ZIP + GZIP report attachments.
 - Backfill: unlimited mailbox history, oldest-to-newest with checkpointing.
@@ -151,7 +151,7 @@ authoritative endpoint list.
 ### PostgreSQL
 
 - OLTP store for config + raw/normalized report data.
-- Job queue and checkpoints.
+- Mailbox checkpoints and sync-run history (no job queue; see §7).
 - Audit logs and notification state.
 - Export task metadata and artifact pointers.
 
@@ -171,7 +171,7 @@ authoritative endpoint list.
 ### Kubernetes (equal priority)
 
 - `Deployment`: API pod(s)
-- `CronJob`: periodic worker runs for polling/reconciliation
+- `Deployment` (worker): one replica, running the polling loop continuously
 - `Job`: migration/init container for EF migrations
 - `Service` + `Ingress` for API/UI
 - `Secret`/`ConfigMap` for credentials and config
@@ -243,8 +243,8 @@ export.
 
 ## 6) Ingestion and Routing Flow
 
-1. Scheduler creates mailbox sync jobs.
-2. Worker acquires job lock and opens source mailbox (IMAP/POP3 via MailKit).
+1. Each worker pass reads every active polled source (no job rows are created).
+2. Worker opens the source mailbox (IMAP/POP3 via MailKit).
 3. Fetch candidate messages (checkpoint-aware).
 4. Extract DMARC attachments (`.zip`, `.gz`, raw xml if present).
 5. Parse XML with `DmarcRua`.
@@ -282,18 +282,31 @@ Configured via `Worker__*` settings:
 
 - Archive extraction compatibility still needs hardening for certain unsupported ZIP compression methods.
 
-## 7) Queue, Scheduling, and Retry Model
+## 7) Scheduling and Retry Model
 
-- DB-backed jobs table:
-  - `job_type`, `payload`, `status`, `attempt_count`, `next_attempt_at`, `locked_by`, `locked_until`.
-- Retry policy:
-  - exponential backoff
-  - max attempts by job type
-  - dead-letter terminal status for operator review.
-- Idempotency:
-  - dedup key for report ingest.
-  - checkpoint monotonic progression (oldest-to-newest backfill).
-- Cron in K8s triggers worker execution; worker drains due jobs safely.
+There is no job queue. `QueueWorkerService` is an interval loop, and the class
+name is the only trace of the queue ADR 0002 proposed (superseded in part by
+ADR 0008). No job entity or table exists.
+
+- Loop: every `Worker__ScheduleIntervalSeconds` (3600 in `appsettings.json`;
+  floored at 15s) the worker runs one pass. The pass reads every active
+  polled source (`IsActive` and a polled protocol) and syncs each in turn.
+  After a failed pass it retries sooner, with backoff from 5s up to the
+  interval, so a worker that starts before the database is ready recovers fast.
+- Other work in the same loop (alerts, digests, retention, DNS refresh, MTA-STS,
+  backup offload, mailbox retention) is gated by an in-memory "last run" field
+  compared against its own interval. The gates share no state between processes
+  and reset on restart, so the effective resolution is the loop interval.
+- Retry: one source sync is retried in-process with exponential backoff, up to
+  `Worker__MaxRetryAttempts` (`Worker__RetryBaseDelaySeconds` is the base). A
+  source that still fails is recorded in `mailbox_sync_run` and tried again on
+  the next pass. There is no dead-letter state.
+- Idempotency: report inserts are `ON CONFLICT DO NOTHING` against real unique
+  indexes, and backfill checkpoints advance oldest-to-newest.
+- One worker per database: nothing claims or leases work, so
+  `WorkerSingleInstanceLock` takes a Postgres advisory lock at startup and the
+  process exits if another holds it. Why the limit exists, and what lifting it
+  would take, is in ADR 0008 and `backlog.md`.
 
 ## 8) Security Model
 
