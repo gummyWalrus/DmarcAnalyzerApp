@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 
 import { StatCard } from '@/components/data/StatCard'
@@ -21,6 +21,7 @@ import { fetchJson } from '@/lib/api'
 import { useAuth } from '@/lib/auth-context'
 import { isAdmin, isStaff } from '@/lib/authz'
 import { formatRelativeOrDate } from '@/lib/format'
+import { loadErrorMessage, useLoader } from '@/lib/use-loader'
 import { usePageTitle } from '@/lib/use-page-title'
 import { cn } from '@/lib/utils'
 
@@ -36,32 +37,16 @@ export function AlertsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const days = parseAnalyticsDays(searchParams.get('days'))
 
-  const [alerts, setAlerts] = useState<AlertEvent[] | null>(null)
-  const [busy, setBusy] = useState(true)
+  const loader = useLoader(
+    useCallback(() => fetchJson<AlertEvent[]>(`/api/v1/alerts?days=${days}`), [days]),
+  )
+  const alerts = loader.data ?? null
+  const busy = loader.loading
+  const { reload: loadData, setData: setAlerts } = loader
   const [evaluating, setEvaluating] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [actionError, setError] = useState<string | null>(null)
+  const error = actionError ?? loadErrorMessage(loader.error, 'Failed to load alerts')
   const [notice, setNotice] = useState<string | null>(null)
-  const requestSeq = useRef(0)
-
-  const loadData = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
-      const payload = await fetchJson<AlertEvent[]>(`/api/v1/alerts?days=${days}`)
-      if (seq === requestSeq.current) setAlerts(payload)
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load alerts')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [days])
-
-  useEffect(() => {
-    void loadData()
-  }, [loadData])
 
   const setDays = (next: AnalyticsDays) => {
     setSearchParams(
@@ -142,7 +127,7 @@ export function AlertsPage() {
       </div>
 
       {error ? (
-        <div className="mb-3.5 rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <div className="mb-3.5 rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </div>
       ) : null}
@@ -188,7 +173,7 @@ export function AlertsPage() {
             </div>
             {alerts.length === 0 ? (
               <div className="flex flex-col items-center gap-2 px-5 pb-10 pt-4 text-center">
-                <Icon name="circle-check" size={32} className="text-[var(--status-ok-dot)]" />
+                <Icon name="circle-check" size={32} className="text-(--status-ok-dot)" />
                 <p className="text-sm font-semibold text-body">Nothing to report</p>
                 <p className="max-w-md text-sm text-secondary">
                   No compliance drops or policy regressions in this window.
@@ -224,7 +209,7 @@ export function AlertsPage() {
                             {alert.domainId ? (
                               <Link
                                 to={`/domains/${alert.domainId}`}
-                                className="text-sm font-medium text-body underline decoration-dotted underline-offset-2 hover:text-brand"
+                                className="text-sm font-medium text-body underline decoration-dotted underline-offset-2 hover:text-link"
                               >
                                 {alert.title}
                               </Link>
@@ -250,7 +235,7 @@ export function AlertsPage() {
                             {alert.notifiedAtUtc ? (
                               formatRelativeOrDate(alert.notifiedAtUtc)
                             ) : (
-                              <span className="text-[var(--status-warn-fg)]">not sent</span>
+                              <span className="text-(--status-warn-fg)">not sent</span>
                             )}
                           </TableCell>
                           {staff ? (

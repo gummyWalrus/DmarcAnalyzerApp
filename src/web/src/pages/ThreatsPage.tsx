@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 
 import { PolicyBadge } from '@/components/data/PolicyBadge'
@@ -19,6 +19,7 @@ import {
 import { fetchJson } from '@/lib/api'
 import type { Client } from '@/lib/entities'
 import { formatCompact, formatFullDate, formatPercent, formatRelativeOrDate } from '@/lib/format'
+import { loadErrorMessage, useLoader } from '@/lib/use-loader'
 import { usePageTitle } from '@/lib/use-page-title'
 import { cn } from '@/lib/utils'
 
@@ -35,11 +36,7 @@ export function ThreatsPage() {
   const clientFilter = searchParams.get('client') ?? ''
 
   const [clients, setClients] = useState<Client[]>([])
-  const [feed, setFeed] = useState<ThreatFeed | null>(null)
-  const [busy, setBusy] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [hostnames, setHostnames] = useState<Record<string, string | null>>({})
-  const requestSeq = useRef(0)
 
   useEffect(() => {
     void fetchJson<Client[]>('/api/v1/clients').then(setClients).catch(() => {
@@ -47,28 +44,15 @@ export function ThreatsPage() {
     })
   }, [])
 
-  const loadData = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
+  const loader = useLoader(
+    useCallback(() => {
       const clientParam = clientFilter ? `&clientId=${encodeURIComponent(clientFilter)}` : ''
-      const payload = await fetchJson<ThreatFeed>(
-        `/api/v1/analytics/threats?days=${days}&limit=100${clientParam}`,
-      )
-      if (seq === requestSeq.current) setFeed(payload)
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load threat feed')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [days, clientFilter])
-
-  useEffect(() => {
-    void loadData()
-  }, [loadData])
+      return fetchJson<ThreatFeed>(`/api/v1/analytics/threats?days=${days}&limit=100${clientParam}`)
+    }, [days, clientFilter]),
+  )
+  const feed = loader.data ?? null
+  const busy = loader.loading
+  const error = loadErrorMessage(loader.error, 'Failed to load threat feed')
 
   const sortedClients = useMemo(
     () => [...clients].sort((a, b) => a.name.localeCompare(b.name)),
@@ -155,7 +139,7 @@ export function ThreatsPage() {
       </div>
 
       {error ? (
-        <div className="mb-3.5 rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <div className="mb-3.5 rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </div>
       ) : null}
@@ -191,7 +175,7 @@ export function ThreatsPage() {
             </div>
             {feed.sources.length === 0 ? (
               <div className="flex flex-col items-center gap-2 px-5 pb-10 pt-4 text-center">
-                <Icon name="circle-check" size={32} className="text-[var(--status-ok-dot)]" />
+                <Icon name="circle-check" size={32} className="text-(--status-ok-dot)" />
                 <p className="text-sm font-semibold text-body">No unauthenticated sources</p>
                 <p className="max-w-md text-sm text-secondary">
                   {clientFilter
@@ -241,7 +225,7 @@ export function ThreatsPage() {
                           <TableCell>
                             <Link
                               to={`/domains/${source.domainId}${domainQuery ? `?${domainQuery}` : ''}`}
-                              className="font-mono text-xs text-body underline decoration-dotted underline-offset-2 hover:text-brand"
+                              className="font-mono text-xs text-body underline decoration-dotted underline-offset-2 hover:text-link"
                               title={
                                 attributable
                                   ? 'Open the domain drill-down with this source expanded'
@@ -252,7 +236,7 @@ export function ThreatsPage() {
                             </Link>
                           </TableCell>
                           <TableCell className="text-sm text-secondary">{source.clientName}</TableCell>
-                          <TableCell className="text-right font-semibold tabular-nums text-[var(--status-danger-fg)]">
+                          <TableCell className="text-right font-semibold tabular-nums text-(--status-danger-fg)">
                             {formatCompact(source.failedMessages)}
                           </TableCell>
                           <TableCell className="text-right tabular-nums text-secondary">

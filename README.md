@@ -59,7 +59,7 @@ variables.
   `linux/arm64`. Mirrored to Docker Hub as `dmarcanalyzernet/dmarc-analyzer`;
   GHCR is recommended because it has no anonymous pull rate limits.
 - Tags: **`latest`** is the most recent release (what the compose file uses), or
-  pin a version such as `0.14.0`. **`edge`** tracks `main` and is unreleased —
+  pin a version such as `0.15.0`. **`edge`** tracks `main` and is unreleased —
   useful for trying a fix early, not for production.
 - Next steps: add a client, a domain, and a report source (the inbox your
   `rua=` reports arrive in) — see `docs/ops/mailbox-sync.md`.
@@ -223,6 +223,8 @@ Ops runbook:
   newer image, including why a green healthcheck does not prove the schema is current.
 - `docs/ops/upgrading-postgresql.md` — the PostgreSQL 17 → 18 migration. A major
   version cannot upgrade in place; this is the dump-and-restore window.
+- `docs/ops/aws-rds-iam.md` — Postgres on AWS with no database password: IAM tokens,
+  which CA to verify against (RDS endpoint vs RDS Proxy), and the Compose and Helm recipe.
 - `docs/ops/mailbox-sync.md`
 - `docs/ops/oidc-zitadel.md` — and the per-provider guides it links, including
   `docs/ops/oidc-entra.md`, which Microsoft Entra ID needs rather than merely benefits from.

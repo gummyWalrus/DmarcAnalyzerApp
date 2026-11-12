@@ -30,10 +30,10 @@ List values take an index: `Network__TrustedNetworks__0`,
 The settings this app binds to its own options — the `Worker__*`, `Email__*`,
 `Alerts__*`, `Digest__*`, `Branding__*`, `Dns__*`, `MtaSts__*`, `Retention__*`, `Network__*`,
 `Backup__*` and `Auth__Oidc__*` groups below, plus `Database__MigrateOnStartup`
-— are typed, and a value that does not convert stops the process at startup with
-a message naming the variable. That is deliberate: a setting silently falling
-back to its default is the failure mode the rule above already warns about, and
-it is worse.
+and `Database__IamAuth` — are typed, and a value that does not convert stops the
+process at startup with a message naming the variable. That is deliberate: a
+setting silently falling back to its default is the failure mode the rule above
+already warns about, and it is worse.
 
 Two things are outside that check, and neither is an oversight. Variables read
 by the framework or another SDK rather than by this app — `ASPNETCORE_*`,
@@ -79,7 +79,7 @@ Two settings have no usable default.
 |---|---|
 | `Security__CredentialEncryptionKey` | AES-256-GCM key protecting stored mailbox passwords. Generate with `openssl rand -base64 32`. **Back it up.** Lose or change it and every stored mailbox credential becomes undecryptable; each source has to be entered again. |
 | `ConnectionStrings__Default` | Npgsql connection string. The Compose files build this from `DMARC_DB_*`; set it directly if you prefer. |
-| `DATABASE_URL` | A `postgres://user:pass@host:port/database` URI, converted to Npgsql format internally. Takes priority over `ConnectionStrings__Default` when both are set. For platforms (Render, Heroku, Railway, ...) that hand you a managed database as a URI rather than an ADO.NET string. A `sslmode` query parameter is honored (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`). |
+| `DATABASE_URL` | A `postgres://user:pass@host:port/database` URI, converted to Npgsql format internally. Takes priority over `ConnectionStrings__Default` when both are set. For platforms (Render, Heroku, Railway, ...) that hand you a managed database as a URI rather than an ADO.NET string. Two query parameters are honored: `sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`) and `sslrootcert` (a CA file path, as `Root Certificate=`). |
 
 ## Runtime shape
 
@@ -87,6 +87,7 @@ Two settings have no usable default.
 |---|---|---|
 | `APP_MODE` | `api` | `api` (console + HTTP), `worker` (ingestion loop only), `all` (both in one process), `migrate` (apply pending migrations and exit), or `mta-sts` (only the public MTA-STS policy routes plus health probes — an internet-facing policy host separate from the console; see [mta-sts-hosting.md](./mta-sts-hosting.md)). Any other value fails startup rather than falling back. |
 | `Database__MigrateOnStartup` | `false` | Apply pending EF migrations at boot. The Compose files set it true. On Kubernetes leave it false and use the migration Job — with more than one replica, startup migration races. |
+| `Database__IamAuth` | `false` | Log in to Amazon RDS, Aurora or RDS Proxy with an IAM authentication token instead of a password, generated per connection from the AWS credential chain (ECS task role, instance profile, IRSA). Leave the password out of the connection string. TLS is required and the server is verified: `disable` fails startup, and `allow`, `prefer` or `require` are raised to `verify-full`. Which CA to verify against is yours to supply, because an RDS endpoint needs the Amazon RDS bundle and an RDS Proxy endpoint needs the system store; Npgsql looks, in order, at `Root Certificate=` in the connection string, `PGSSLROOTCERT`, `~/.postgresql/root.crt` if it exists, and otherwise the system trust store. The region comes from the AWS SDK's region chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, a profile, or EC2 instance metadata), not from the hostname. Applies to every mode; `dotnet ef` at design time still uses a password. The recipe, for Compose and Helm, is [aws-rds-iam.md](./aws-rds-iam.md). |
 | `ASPNETCORE_URLS` | `http://+:8080` | Set in the image; override only for an unusual port inside the container. |
 
 Worker mode does **not** apply migrations, whatever this is set to — only the web
@@ -235,13 +236,16 @@ mail of its own for each client set to *separate*.
 
 ## Branding (`Branding`)
 
-The agency's identity on digest mail. One brand for the whole instance.
+The agency's identity on digest mail and in the console: the sign-in page, the header,
+and the browser tab title. One brand for the whole instance. The console reads it from
+the public `GET /api/v1/branding`, so a client sees it before signing in.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `Branding__Name` | `DMARC Analyzer` | Name shown at the top and bottom of every digest. |
-| `Branding__LogoUrl` | *(empty)* | Absolute `https://` URL of a logo, shown 32px high in place of the name at the top. The footer still names the agency in text, because many mail clients hold images back until the reader allows them. Anything that is not an http(s) URL is ignored. |
-| `Branding__AccentColor` | `#0c7568` | Six-digit hex colour for the top rule, links and the button. Anything else falls back to the default. |
+| `Branding__Name` | `DMARC Analyzer` | Name shown at the top and bottom of every digest, in the console header when no logo is set, and in the tab title (`Domains · <name>`). |
+| `Branding__LogoUrl` | *(empty)* | Absolute `https://` URL of a logo. In a digest it is shown 32px high in place of the name at the top, and the footer still names the agency in text, because many mail clients hold images back until the reader allows them. In the console it replaces the product's logo and name on the sign-in page and in the header, so it should carry the agency's name itself; it is shown on a light background. Anything that is not an http(s) URL is ignored. |
+| `Branding__AccentColor` | `#0c7568` | Six-digit hex colour. In a digest: the top rule, links and the button. In the console: primary buttons, links, focus rings and the active navigation item; hover and tint shades are derived from it, and text on it turns dark when white would not be legible. A mid-tone on which neither is legible (a `#808080` grey) is darkened on buttons until white is. Anything else falls back to the default. |
+| `Branding__HidePoweredBy` | `false` | Once any of the three settings above is changed, the console shows a small "powered by DMARC Analyzer" line on the sign-in page and at the foot of the navigation. `true` hides it. An unbranded instance never shows it. |
 
 ## DNS policy checks (`Dns`)
 

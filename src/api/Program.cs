@@ -42,8 +42,9 @@ if (mode == AppMode.Migrate)
         ?? throw new InvalidOperationException(
             "ConnectionStrings:Default or DATABASE_URL is required in migrate mode.");
 
+    var migrateDataSource = DatabaseDataSource.Create(migrateBuilder.Configuration, migrateConnectionString);
     migrateBuilder.Services.AddDbContext<DmarcAnalyzerDbContext>(options =>
-        options.UseNpgsql(migrateConnectionString));
+        options.UseNpgsql(migrateDataSource));
     migrateBuilder.Services.AddHttpContextAccessor();
     migrateBuilder.Services.AddScoped<ICurrentUserContext, SystemUserContext>();
     migrateBuilder.Services.AddScoped<IAuditLog, AuditLog>();
@@ -54,6 +55,7 @@ if (mode == AppMode.Migrate)
     var migrateLogger = scope.ServiceProvider
         .GetRequiredService<ILoggerFactory>().CreateLogger("Migrate");
     migrateLogger.LogTelemetryStatus(migrateTelemetry);
+    migrateLogger.LogDatabaseAuthStatus(migrateBuilder.Configuration, migrateDataSource);
 
     // The same budget the other two paths use. AddDmarcReportRecordRangeBegin
     // rewrites 5.3M rows in ~94s on a production-sized database, well past
@@ -95,8 +97,9 @@ if (mode == AppMode.Worker)
     var workerConnectionString = ConnectionStringResolver.Resolve(workerBuilder.Configuration)
         ?? "Host=localhost;Port=5432;Database=dmarc_analyzer;Username=postgres;Password=postgres";
 
+    var workerDataSource = DatabaseDataSource.Create(workerBuilder.Configuration, workerConnectionString);
     workerBuilder.Services.AddDbContext<DmarcAnalyzerDbContext>(options =>
-        options.UseNpgsql(workerConnectionString));
+        options.UseNpgsql(workerDataSource));
     workerBuilder.Services.AddCredentialProtection(workerBuilder.Configuration);
     workerBuilder.Services.AddScoped<IDmarcReportParser, DmarcRuaReportParser>();
     workerBuilder.Services.AddScoped<ITlsRptReportParser, TlsRptReportParser>();
@@ -155,8 +158,9 @@ if (mode == AppMode.Worker)
     workerBuilder.Services.AddHostedService<QueueWorkerService>();
 
     var workerHost = workerBuilder.Build();
-    workerHost.Services.GetRequiredService<ILoggerFactory>()
-        .CreateLogger("Telemetry").LogTelemetryStatus(workerTelemetry);
+    var workerLoggerFactory = workerHost.Services.GetRequiredService<ILoggerFactory>();
+    workerLoggerFactory.CreateLogger("Telemetry").LogTelemetryStatus(workerTelemetry);
+    workerLoggerFactory.CreateLogger("Database").LogDatabaseAuthStatus(workerBuilder.Configuration, workerDataSource);
     await workerHost.RunAsync();
     return;
 }
@@ -181,8 +185,9 @@ if (mode == AppMode.MtaSts)
         ?? throw new InvalidOperationException(
             "ConnectionStrings:Default or DATABASE_URL is required in mta-sts mode.");
 
+    var mtaStsDataSource = DatabaseDataSource.Create(mtaStsBuilder.Configuration, mtaStsConnectionString);
     mtaStsBuilder.Services.AddDbContext<DmarcAnalyzerDbContext>(options =>
-        options.UseNpgsql(mtaStsConnectionString));
+        options.UseNpgsql(mtaStsDataSource));
     mtaStsBuilder.Services.AddMemoryCache();
     mtaStsBuilder.Services.Configure<MtaStsOptions>(mtaStsBuilder.Configuration.GetSection("MtaSts"));
     mtaStsBuilder.Services.AddScoped<IMtaStsPolicyHostService, MtaStsPolicyHostService>();
@@ -195,8 +200,9 @@ if (mode == AppMode.MtaSts)
         LoggerFactory.Create(b => b.AddConsole()).CreateLogger(nameof(ForwardedHeadersSetup)));
 
     var mtaStsApp = mtaStsBuilder.Build();
-    mtaStsApp.Services.GetRequiredService<ILoggerFactory>()
-        .CreateLogger("Telemetry").LogTelemetryStatus(mtaStsTelemetry);
+    var mtaStsLoggerFactory = mtaStsApp.Services.GetRequiredService<ILoggerFactory>();
+    mtaStsLoggerFactory.CreateLogger("Telemetry").LogTelemetryStatus(mtaStsTelemetry);
+    mtaStsLoggerFactory.CreateLogger("Database").LogDatabaseAuthStatus(mtaStsBuilder.Configuration, mtaStsDataSource);
 
     if (mtaStsUseForwardedHeaders)
     {
@@ -240,8 +246,12 @@ builder.Services.AddCarter();
 // startup crash rather than becoming a 500 on an endpoint.
 builder.Services.AddSingleton(new AppRuntimeInfo(mode));
 builder.Services.AddRouting(options => options.LowercaseUrls = true);
+// Built once, outside the options callback: a data source owns the connection
+// pool (and, with IAM auth, the token refresh timer), so one per DbContext would
+// mean one pool per request.
+var dataSource = DatabaseDataSource.Create(builder.Configuration, connectionString);
 builder.Services.AddDbContext<DmarcAnalyzerDbContext>(options =>
-    options.UseNpgsql(connectionString));
+    options.UseNpgsql(dataSource));
 builder.Services.AddCredentialProtection(builder.Configuration);
 builder.Services.AddOidcAuthentication(builder.Configuration);
 builder.Services.AddScoped<IOidcSignInService, OidcSignInService>();
@@ -350,8 +360,9 @@ var useForwardedHeaders = ForwardedHeadersSetup.TryConfigure(
 
 var app = builder.Build();
 
-app.Services.GetRequiredService<ILoggerFactory>()
-    .CreateLogger("Telemetry").LogTelemetryStatus(apiTelemetry);
+var appLoggerFactory = app.Services.GetRequiredService<ILoggerFactory>();
+appLoggerFactory.CreateLogger("Telemetry").LogTelemetryStatus(apiTelemetry);
+appLoggerFactory.CreateLogger("Database").LogDatabaseAuthStatus(builder.Configuration, dataSource);
 
 if (useForwardedHeaders)
 {

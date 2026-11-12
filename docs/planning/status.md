@@ -11,13 +11,19 @@ Current implementation snapshot for `DmarcAnalyzerApp`.
   host serving only the public routes and health probes). Docker Compose ships as a single combined container plus PostgreSQL,
   with overlays for an external database and for splitting console from worker.
   A Helm chart (`deploy/helm/dmarc-analyzer`) exposes the same two axes, applies
-  migrations via a pre-install Job, and is published to
+  migrations via a pre-install Job, sets memory and CPU requests (no limits) on
+  every container, and is published to
   `oci://ghcr.io/dmarc-analyzer-net/charts/dmarc-analyzer` on a release tag.
   Exactly one ingestion worker may run per database, enforced by a Postgres
   advisory lock. A Render Blueprint (`render.yaml`, repo root) is a third deploy
   path — provisions the app plus a managed Postgres and wires them together via
   `DATABASE_URL`, which the app accepts as a `postgres://` URI alongside the
-  existing ADO.NET `ConnectionStrings__Default`.
+  existing ADO.NET `ConnectionStrings__Default`. On Amazon RDS or Aurora,
+  `Database__IamAuth` replaces the stored password with an IAM authentication
+  token from the ambient AWS credential chain, generated per connection, in every
+  mode including the worker's advisory-lock connection, with the server verified
+  against a CA the operator names (RDS bundle, or the system store for RDS Proxy)
+  — recipe in `docs/ops/aws-rds-iam.md`.
 - **Backup, offload and recovery** (ADR 0009, design detail in
   `config-export-and-recovery.md`). A JSON configuration artifact — clients, domains,
   report sources with their encrypted credentials, recipients, users, identities,
@@ -307,8 +313,11 @@ Current implementation snapshot for `DmarcAnalyzerApp`.
   - plaintext passthrough with startup warning when no key is configured
 
 - Guided path to enforcement:
-  - `GET /api/v1/analytics/domains/{id}/enforcement` — server-computed recommendation for the next safe policy step (none → quarantine → reject), rationale, `readyToAdvance`, and the blocking sources still sending unaligned mail
-  - Domain Detail "Path to enforcement" panel upgraded with the server guidance banner + blocking-source quick links (expand via `?source=`)
+  - `GET /api/v1/analytics/domains/{id}/enforcement` — server-computed recommendation for the next safe policy step, rationale, `readyToAdvance`, and the blocking sources still sending unaligned mail
+  - the ladder is RFC 9989's: `p=none` → `p=quarantine; t=y` → enforced `p=quarantine` → `p=reject`. `pct=` is never advised (RFC 9989 Appendix A.6 retired it), and `t=y` is read as well as written — under it a receiver applies one level below the stated policy (§4.7), so a domain at `p=quarantine; t=y` is not enforcing quarantine and dropping the tag is a step of its own
+  - `recordChange` — the exact record to publish, built by editing the live record so `rua`, `ruf`, `sp`, `adkim`, `aspf`, `fo` and anything unrecognized survive; null when the step moves neither `p` nor `t`, and null (with the console naming the possible causes) when the lookup failed, the policy is inherited, or the live record is one a receiver reads differently than it looks — a mis-cased known tag, a repeated tag name, a `v=` that is not exactly `DMARC1` (all per RFC 6376 §3.2, adopted by RFC 9989 §4.7). Record inspection reports those; the builder refuses to hand back a record that would look repaired and not be. A retired `pct=` is dropped from a record a real step produces but is never on its own a reason to offer one — "publish this" under "change nothing" contradicts itself
+  - `evidence` — messages, sources, reports, days with data and the date span behind the verdict, so a call on four messages does not read like one on a month of traffic
+  - Domain Detail "Path to enforcement" panel upgraded with the server guidance banner, the evidence line, the record to publish with a copy button, and blocking-source quick links (expand via `?source=`)
 
 - Threat feed (spoofing investigation):
   - `GET /api/v1/analytics/threats` — tenant-scoped list of (source IP, domain) pairs with fully unauthenticated volume (DKIM and SPF both failed), worst first, with first/last-seen
@@ -318,6 +327,7 @@ Current implementation snapshot for `DmarcAnalyzerApp`.
 - Record inspection (published vs observed):
   - `IDnsTxtResolver` (DnsClient against the host's configured resolver — no third-party DoH) with short-lived caching
   - `GET /api/v1/analytics/domains/{id}/records` — live `_dmarc`/SPF TXT records parsed tag-by-tag (multiple-record permerror, missing rua, +all, 10-lookup count) and compared field-by-field against the latest `policy_published` reporters observed
+  - tag-value syntax faults are reported as well as tag values, because they fail silently and totally: a known tag published in the wrong case (`RUA=` is not `rua=`, so no reports are sent), a tag name appearing twice (invalidates the whole record), a `v=` that is not exactly `DMARC1`, and a segment that is not `name=value`. RFC 9989 §4.7 takes its syntax from RFC 6376 §3.2, which is case-sensitive and forbids duplicates; the parser itself stays lenient so the card still has something to show
   - Domain Detail "Record inspection" card, fetched separately so slow DNS never blocks the analytics render
 
 - MTA-STS monitoring (RFC 8461):
@@ -420,6 +430,24 @@ Current implementation snapshot for `DmarcAnalyzerApp`.
     `GET /api/v1/admin/digest/preview` (and `/preview.html`) renders a client's
     or a recipient's mails without sending, `POST /api/v1/admin/digest/send`
     sends anything due
+
+- Console branding:
+  - the same instance-wide `Branding:*` brand as the digest, served by the public
+    `GET /api/v1/branding` so the sign-in page wears it before anyone logs in.
+    A logo replaces the product's lockup; a name alone is shown as a wordmark
+    without the product's shield; the name suffixes every tab title
+  - the accent drives primary buttons, links, focus rings, the active nav item
+    and brand badges; data colours (chart bars, status badges) stay semantic.
+    `deriveBrandPalette` keeps WCAG AA for any accent: text on a button turns dark
+    when white would fail, brand-coloured text is darkened until it clears 4.5:1
+    on every light surface, and the focus ring is solid at 3:1 or better — the
+    default ring too, which was a 28% tint at 1.4:1
+  - the last brand seen is cached in `localStorage` and applied before the first
+    render; a first visit leaves the logo slot empty until the fetch lands rather
+    than flashing the product's brand
+  - "Powered by DMARC Analyzer" on the sign-in page and at the foot of the
+    navigation once branded, unless `Branding:HidePoweredBy`. An unbranded
+    instance is unchanged
 
 - Console pages for notifications:
   - **Alerts** — history with severity, type, status, per-domain links, whether
@@ -535,6 +563,40 @@ Current implementation snapshot for `DmarcAnalyzerApp`.
   the ~36 single-child headings that grouping everything would have added. The
   parent is usually *not* monitored (reports only arrive for the sending
   subdomain), so that heading is a label with no metrics and nothing to click.
+  Such a heading now carries the group's own compliance rollup, so a group of ten
+  subdomains has a readable total instead of being the one row with no numbers.
+
+- Visual analytics on Domains and Domain detail, built on one shared `SegmentBar`
+  primitive so a stacked bar means the same thing everywhere it appears:
+  - **Enforcement posture panel** above the Domains table — the domains in scope
+    stacked by posture, with a legend whose entries are filter toggles
+    (`?status=`, linkable and carried into the drill-down and back). The bar
+    reflects the client/search/policy filters but deliberately *not* the posture
+    filter, which would otherwise collapse it to the segment just selected. A
+    posture with no domains stays visible and unclickable: the absence of a
+    `Spoofing` segment is information. `no_data` gets a fill of its own rather
+    than sharing `monitoring`'s grey, because as adjacent segments "publishes
+    p=none" must not look like "we have never heard from this domain".
+  - Compliance reads as a **composition** (aligned teal / failing red against the
+    window's message total) rather than a single fill whose colour steps at 95%
+    and 75% — a domain at 99.4% shows a red sliver you can see is a sliver. The
+    verdict stays with the Status badge, so the bar does not encode it twice.
+  - DKIM and SPF pass rates sit under it as paired micro meters, both in **one
+    neutral brand tone, not a traffic light**: DMARC passes when either aligns,
+    so a forwarding-heavy sender legitimately sits at 40% SPF with 99%
+    compliance, and reddening that would assert a failure that is not one. On
+    Domain detail the same pair becomes an "Alignment" tile headlined by the
+    mechanism actually carrying it.
+  - Volume bars scale against the busiest domain in view, so the column reads as
+    a ranking; Domain detail gains a **disposition** tile (delivered /
+    quarantined / rejected, delivered derived as the remainder) and a daily
+    average, replacing the bare "quarantined + rejected" count.
+  - `TrendChart` gained a pass/fail key, the peak-day value (it has no y axis),
+    a per-day `<title>` with a full-height hit area, and one `role="img"`
+    summary for the whole plot.
+  - Every bar carries an accessible name and no state is colour-only. Rows with
+    no reports in the window render "—" rather than a zeroed bar, so no data
+    never reads as total failure.
   Sort order is preserved: a group appears where its first member landed, so
   worst-compliance-first still puts the worst group first.
 

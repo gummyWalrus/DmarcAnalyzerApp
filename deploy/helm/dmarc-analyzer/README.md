@@ -9,7 +9,7 @@ single list of settings for both.
 
 ```bash
 helm install dmarc oci://ghcr.io/dmarc-analyzer-net/charts/dmarc-analyzer \
-  --version 0.14.0 \
+  --version 0.15.0 \
   --namespace dmarc --create-namespace \
   --set auth.encryptionKey="$(openssl rand -base64 32)"
 ```
@@ -56,7 +56,7 @@ helm install dmarc ./deploy/helm/dmarc-analyzer -n dmarc \
   --set postgres.enabled=false \
   --set externalDatabase.host=db.internal \
   --set externalDatabase.username=dmarc \
-  --set image.tag=0.14.0
+  --set image.tag=0.15.0
 ```
 
 Where policy calls for immutable images, pin the digest instead of the tag:
@@ -65,7 +65,7 @@ every container in the release. Use the digest published for the release you
 intend to run — the chart refuses a shortened or malformed one. The two cannot
 be set together, and leaving both empty follows the chart's `appVersion`.
 
-Five things worth doing deliberately:
+Six things worth doing deliberately:
 
 - **`auth.existingSecret`.** Otherwise the encryption key sits in your values
   file, your shell history, and `helm get values`.
@@ -80,6 +80,12 @@ Five things worth doing deliberately:
   a configuration export shipped to S3-compatible object storage, refused
   outright if the credential key above isn't set. See
   [`docs/ops/configuration.md`](../../../docs/ops/configuration.md#backup-offload-backup).
+- **On AWS, drop the database password.** `Database__IamAuth: "true"` in
+  `extraEnv`, an IRSA role on `serviceAccount.annotations`, and a password-less
+  `externalDatabase.connectionString`. An RDS or Aurora endpoint also needs the
+  Amazon RDS CA bundle mounted through `extraVolumes`/`extraVolumeMounts` and
+  named in `PGSSLROOTCERT` via `extraEnv`; an RDS Proxy endpoint needs no file. The
+  worked example is [`docs/ops/aws-rds-iam.md`](../../../docs/ops/aws-rds-iam.md).
 - **Pin `image.digest` for immutable deployments.** A tag is still convenient
   for evaluation, and an empty `image.tag` follows the chart's `appVersion`, but
   tags can be moved. The chart refuses a non-empty tag and digest together so
@@ -103,6 +109,51 @@ no-op.
 `activeDeadlineSeconds` defaults to 900. The largest shipped migration rewrites
 about 5.3M rows in roughly 94 seconds, so the default has room, but a very large
 database may want more.
+
+## Resources
+
+Every container ships with a memory and CPU **request** and no **limit**:
+
+| Values key | Memory | CPU |
+|---|---|---|
+| `app.resources` | 384Mi | 100m |
+| `worker.resources` (split mode) | 384Mi | 100m |
+| `postgres.resources` (bundled) | 256Mi | 100m |
+| `migrations.resources` (the Job) | 128Mi | 50m |
+| `waitForDatabase.resources` (init container) | 64Mi | 50m |
+
+The `wait-for-database` init container, which runs before the app, the worker and
+the migrate Job whenever there is a database host to wait for, carries one too.
+At the defaults it does not change how the pod is scheduled. Kubernetes sizes a
+pod per resource, taking the larger of its biggest init container request and the
+sum of its main containers' requests, and the main containers ask for more. That
+stops being true if you remove the main containers' requests or set them below
+64Mi/50m; the init request then decides that resource. It is there because a
+namespace with a ResourceQuota on requests rejects any container without one.
+
+The requests are there for scheduling and eviction. With no request, the
+scheduler counts the pod as using nothing and will put it on a node that is
+nearly full, and under memory pressure the kubelet evicts pods that use more than
+they requested first, which with no request means all of their usage. One such
+node evicted the app minutes after a roll and turned away every replacement until
+the pressure passed. 384Mi covers the combined pod's steady state on a
+single-mailbox instance (about 290Mi). Raise it for many mailboxes or a large
+backfill.
+
+There is no memory limit because the failure it would cause is worse than the one
+it prevents. Ingestion memory grows with the size of a sync pass, and a limit
+turns a large backfill into an OOM kill partway through. Add limits in your own
+values if your cluster requires them.
+
+To remove a request, null it rather than emptying the map. Helm merges your
+values into the chart's, so `resources: {}` merges into the default and changes
+nothing:
+
+```yaml
+app:
+  resources:
+    requests: null   # renders resources: {}
+```
 
 ## Values validation
 

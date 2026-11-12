@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 
 import { ComplianceBar } from '@/components/data/ComplianceBar'
+import { ComplianceSplitBar } from '@/components/data/ComplianceSplitBar'
+import { MiniMeter } from '@/components/data/MiniMeter'
 import { PolicyBadge } from '@/components/data/PolicyBadge'
+import { SegmentBar } from '@/components/data/SegmentBar'
 import { SortHeader, type SortDir } from '@/components/data/SortHeader'
 import { StatCard } from '@/components/data/StatCard'
 import { TrendChart } from '@/components/data/TrendChart'
@@ -36,6 +39,7 @@ import {
   type DrilldownDomain,
   type DrilldownTotals,
   type EnforcementGuidance,
+  type EnforcementRecordChange,
   type EvaluatedCombo,
   type MtaStsLiveMx,
   type MtaStsReadiness,
@@ -51,6 +55,9 @@ import {
 import { ApiError, fetchJson } from '@/lib/api'
 import { useAuth } from '@/lib/auth-context'
 import { isAdmin, isStaff } from '@/lib/authz'
+import { describeSegments } from '@/lib/bars'
+import { describeAlignmentCarrier, dispositionBreakdown } from '@/lib/domain-health'
+import { enforcementEvidenceLine } from '@/lib/enforcement'
 import type {
   Domain,
   MtaStsPolicyApplyOutcome,
@@ -61,6 +68,7 @@ import type {
 import { formatCompact, formatFullDate, formatPercent, formatRelativeOrDate, formatShortDate } from '@/lib/format'
 import { NOTE_SEVERITY_BADGE, noteCountLabel, reportNotesSummary } from '@/lib/report-notes'
 import { useHostnames } from '@/lib/use-hostnames'
+import { loadErrorMessage, useLoader } from '@/lib/use-loader'
 import { usePageTitle } from '@/lib/use-page-title'
 import { cn } from '@/lib/utils'
 
@@ -168,16 +176,16 @@ function PanelSectionTitle({ children }: { children: ReactNode }) {
 /** Colors a raw DKIM/SPF verdict: pass ok, hard failures danger, soft results warn. */
 function resultTone(result: string): string {
   const value = result.toLowerCase()
-  if (value === 'pass') return 'text-[var(--status-ok-fg)]'
+  if (value === 'pass') return 'text-(--status-ok-fg)'
   if (value === 'fail' || value === 'permerror' || value === 'temperror')
-    return 'text-[var(--status-danger-fg)]'
-  return 'text-[var(--status-warn-fg)]'
+    return 'text-(--status-danger-fg)'
+  return 'text-(--status-warn-fg)'
 }
 
 function EvaluatedChip({ combo }: { combo: EvaluatedCombo }) {
   const compliant = combo.dkim === 'pass' || combo.spf === 'pass'
   const tone = (result: 'pass' | 'fail') =>
-    result === 'pass' ? 'text-[var(--status-ok-fg)]' : 'text-[var(--status-danger-fg)]'
+    result === 'pass' ? 'text-(--status-ok-fg)' : 'text-(--status-danger-fg)'
   return (
     <div className="flex items-center gap-2 rounded-md border border-border bg-surface-card px-3 py-1.5 text-xs">
       <span className="text-secondary">
@@ -244,6 +252,73 @@ export function ValueList({
       ))}
     </ul>
   )
+}
+
+/**
+ * The record to publish for the recommended step, ready to paste into a zone.
+ *
+ * Shown only when the server built one — which it does from the domain's own live
+ * record and nothing else. A failed lookup, a record it cannot rewrite safely, a
+ * policy inherited from the organisational domain, or a step that moves no policy
+ * tag all arrive here as null. The first three say so; the last renders nothing,
+ * because there is no step to explain away. A guessed record is the one output
+ * worse than no suggestion: it is pasted, it is wrong, and nothing bounces.
+ */
+export function EnforcementStepRecord({
+  change,
+  unavailable,
+}: {
+  change: EnforcementRecordChange | null
+  unavailable: boolean
+}) {
+  if (!change) {
+    return unavailable ? (
+      <p className="mt-2.5 border-t border-[color-mix(in_srgb,currentColor_12%,transparent)] pt-2 text-xs leading-relaxed text-secondary">
+        No record to copy for this step: the DNS lookup failed, this domain publishes no DMARC
+        record of its own that can be edited safely, or its policy is inherited from a parent
+        domain. See record inspection below for what is published.
+      </p>
+    ) : null
+  }
+
+  return (
+    <div className="mt-2.5 border-t border-[color-mix(in_srgb,currentColor_12%,transparent)] pt-2.5">
+      <div className="grid grid-cols-[3.5rem_minmax(0,1fr)] items-baseline gap-x-2 gap-y-1 text-xs">
+        <span className="text-secondary">Host</span>
+        <span className="break-all font-mono text-body">{change.host}</span>
+
+        <span className="text-secondary">Now</span>
+        <span className="break-all font-mono text-secondary">{change.current}</span>
+
+        <span className="text-secondary">Publish</span>
+        <span className="flex min-w-0 items-start gap-1">
+          <span className="min-w-0 break-all font-mono font-semibold text-body">
+            {change.recommended}
+          </span>
+          <CopyButton value={change.recommended} label="the record to publish" />
+        </span>
+      </div>
+      <p className="mt-1.5 text-xs text-secondary">
+        Changes {listTags(change.changedTags)}. Everything else stays as published.
+      </p>
+      {change.notes.length > 0 ? (
+        <ul className="mt-1.5 space-y-1">
+          {change.notes.map((note) => (
+            <li key={note} className="text-xs leading-relaxed text-secondary">
+              {note}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  )
+}
+
+/** "p=", or "p= and t=", or "p=, t= and pct=" — the tags a step touches, read aloud. */
+function listTags(tags: string[]): string {
+  const named = tags.map((tag) => `${tag}=`)
+  if (named.length <= 1) return named.join('') || 'nothing'
+  return `${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`
 }
 
 // --- Path to enforcement checklist (derived from real signals) ---
@@ -371,7 +446,7 @@ function RecordBlock({
       {issues.length > 0 ? (
         <ul className="mt-2 space-y-1">
           {issues.map((issue) => (
-            <li key={issue} className="flex items-start gap-1.5 text-xs text-[var(--status-warn-fg)]">
+            <li key={issue} className="flex items-start gap-1.5 text-xs text-(--status-warn-fg)">
               <Icon name="triangle-alert" size={13} className="mt-px shrink-0" />
               {issue}
             </li>
@@ -388,35 +463,15 @@ function RecordBlock({
  * lookups — a slow resolver must never block the drill-down render.
  */
 function RecordInspectionCard({ domainId }: { domainId: string }) {
-  const [inspection, setInspection] = useState<RecordInspection | null>(null)
-  const [busy, setBusy] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const requestSeq = useRef(0)
-
-  // Loader idiom matches the other panels in this file: state is set inside a
-  // callback (not synchronously in the effect body), and a request sequence
-  // guards against out-of-order responses when domainId changes.
-  const loadInspection = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
-      const payload = await fetchJson<RecordInspection>(
-        `/api/v1/analytics/domains/${domainId}/records`,
-      )
-      if (seq === requestSeq.current) setInspection(payload)
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to inspect records')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [domainId])
-
-  useEffect(() => {
-    void loadInspection()
-  }, [loadInspection])
+  const loader = useLoader(
+    useCallback(
+      () => fetchJson<RecordInspection>(`/api/v1/analytics/domains/${domainId}/records`),
+      [domainId],
+    ),
+  )
+  const inspection = loader.data ?? null
+  const busy = loader.loading
+  const error = loadErrorMessage(loader.error, 'Failed to inspect records')
 
   // Only 'differs' counts. A tag DNS never published has nothing to disagree with,
   // and a tag the reporter omitted says nothing about the record either.
@@ -436,7 +491,7 @@ function RecordInspectionCard({ domainId }: { domainId: string }) {
           Looking up live DNS records…
         </div>
       ) : error ? (
-        <p className="rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <p className="rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </p>
       ) : inspection ? (
@@ -469,9 +524,9 @@ function RecordInspectionCard({ domainId }: { domainId: string }) {
                     className={cn(
                       'flex items-start gap-1.5 text-xs leading-relaxed',
                       dest.status === 'not_authorized'
-                        ? 'text-[var(--status-danger-fg)]'
+                        ? 'text-(--status-danger-fg)'
                         : dest.status === 'lookup_failed'
-                          ? 'text-[var(--status-warn-fg)]'
+                          ? 'text-(--status-warn-fg)'
                           : 'text-secondary',
                     )}
                   >
@@ -519,7 +574,7 @@ function RecordInspectionCard({ domainId }: { domainId: string }) {
                       className={cn(
                         'flex items-center gap-2 rounded-md border px-3 py-1.5 font-mono text-xs',
                         differs
-                          ? 'border-[var(--status-warn-bg)] bg-[var(--status-warn-bg)] text-[var(--status-warn-fg)]'
+                          ? 'border-(--status-warn-bg) bg-(--status-warn-bg) text-(--status-warn-fg)'
                           : 'border-border bg-surface-card text-secondary',
                       )}
                       aria-label={describeComparison(row)}
@@ -655,57 +710,50 @@ function TransportSecurityCard({ domainId }: { domainId: string }) {
   const { user } = useAuth()
   const staff = isStaff(user)
   const admin = isAdmin(user)
-  const [state, setState] = useState<MtaStsState | null>(null)
-  const [policyResponse, setPolicyResponse] = useState<MtaStsPolicyResponse | null>(null)
-  const [busy, setBusy] = useState(true)
-  const [rechecking, setRechecking] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const requestSeq = useRef(0)
-
-  const load = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
-      const [statePayload, policyPayload] = await Promise.all([
+  const loader = useLoader(
+    useCallback(async () => {
+      const [state, policyResponse] = await Promise.all([
         fetchJson<MtaStsState>(`/api/v1/analytics/domains/${domainId}/mta-sts`),
         fetchJson<MtaStsPolicyResponse>(`/api/v1/domains/${domainId}/mta-sts-policy`),
       ])
-      if (seq === requestSeq.current) {
-        setState(statePayload)
-        setPolicyResponse(policyPayload)
-      }
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load MTA-STS state')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [domainId])
-
-  useEffect(() => {
-    void load()
-  }, [load])
+      return { domainId, state, policyResponse }
+    }, [domainId]),
+  )
+  const state = loader.data?.state ?? null
+  const policyResponse = loader.data?.policyResponse ?? null
+  const busy = loader.loading
+  const { setData, reload: load } = loader
+  const [rechecking, setRechecking] = useState(false)
+  // Tagged with the domain it is about, like the recheck result below: this card is not
+  // remounted when the route moves to another domain, and a late answer for the old one
+  // must not land on the new one.
+  const [recheckError, setRecheckError] = useState<{ domainId: string; message: string } | null>(
+    null,
+  )
+  const error =
+    (recheckError?.domainId === domainId ? recheckError.message : null) ??
+    loadErrorMessage(loader.error, 'Failed to load MTA-STS state')
 
   const recheck = useCallback(async () => {
-    const seq = ++requestSeq.current
     setRechecking(true)
-    setError(null)
+    setRecheckError(null)
     try {
       const payload = await fetchJson<MtaStsState>(
         `/api/v1/analytics/domains/${domainId}/mta-sts/recheck`,
         { method: 'POST' },
       )
-      if (seq === requestSeq.current) setState(payload)
-    } catch (recheckError) {
-      if (seq === requestSeq.current) {
-        setError(recheckError instanceof Error ? recheckError.message : 'Recheck failed')
-      }
+      setData((current) =>
+        current?.domainId === domainId ? { ...current, state: payload } : current,
+      )
+    } catch (failure) {
+      setRecheckError({
+        domainId,
+        message: failure instanceof Error ? failure.message : 'Recheck failed',
+      })
     } finally {
-      if (seq === requestSeq.current) setRechecking(false)
+      setRechecking(false)
     }
-  }, [domainId])
+  }, [domainId, setData])
 
   const status = state?.dnsRecordStatus
   const statusMeta = status ? MTA_STS_RECORD_META[status] : null
@@ -735,7 +783,7 @@ function TransportSecurityCard({ domainId }: { domainId: string }) {
           Loading MTA-STS state…
         </div>
       ) : error ? (
-        <p className="rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <p className="rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </p>
       ) : !state ? null : !state.checked ? (
@@ -816,7 +864,7 @@ function TransportSecurityCard({ domainId }: { domainId: string }) {
                     key={`${mx.preference}-${mx.host}`}
                     className={cn(
                       'flex items-start gap-1.5 text-xs leading-relaxed',
-                      mx.matched === false ? 'text-[var(--status-danger-fg)]' : 'text-secondary',
+                      mx.matched === false ? 'text-(--status-danger-fg)' : 'text-secondary',
                     )}
                   >
                     <Icon
@@ -834,7 +882,7 @@ function TransportSecurityCard({ domainId }: { domainId: string }) {
               </ul>
             </div>
           ) : state.mxLookupStatus === 'lookup_failed' ? (
-            <p className="text-xs text-[var(--status-warn-fg)]">
+            <p className="text-xs text-(--status-warn-fg)">
               MX lookup failed — the policy&apos;s mx patterns could not be cross-checked.
             </p>
           ) : null}
@@ -844,7 +892,7 @@ function TransportSecurityCard({ domainId }: { domainId: string }) {
               {state.issues.map((issue) => (
                 <li
                   key={issue}
-                  className="flex items-start gap-1.5 text-xs leading-relaxed text-[var(--status-warn-fg)]"
+                  className="flex items-start gap-1.5 text-xs leading-relaxed text-(--status-warn-fg)"
                 >
                   <Icon name="triangle-alert" size={13} className="mt-px shrink-0" />
                   {issue}
@@ -1243,7 +1291,7 @@ export function ReportNotesList({ notes }: { notes: ReportNotes }) {
                         <Badge variant={NOTE_SEVERITY_BADGE[message.severity]} className="shrink-0">
                           {message.severity}
                         </Badge>
-                        <span className="min-w-0 break-words font-mono text-xs">{message.text}</span>
+                        <span className="min-w-0 wrap-break-word font-mono text-xs">{message.text}</span>
                       </li>
                     ))}
                     <li className="font-mono text-xs text-secondary">report id {report.reportId}</li>
@@ -1266,34 +1314,19 @@ export function ReportNotesList({ notes }: { notes: ReportNotes }) {
  * on error reads as "nothing wrong".
  */
 function ReportNotesCard({ domainId, days }: { domainId: string; days: AnalyticsDays }) {
-  const [notes, setNotes] = useState<ReportNotes | null>(null)
-  const [busy, setBusy] = useState(true)
   const [includeInfo, setIncludeInfo] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const requestSeq = useRef(0)
-
-  // Same loader idiom as the other panels in this file (see RecordInspectionCard).
-  const loadNotes = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
-      const payload = await fetchJson<ReportNotes>(
-        `/api/v1/analytics/domains/${domainId}/report-notes?days=${days}&includeInfo=${includeInfo}`,
-      )
-      if (seq === requestSeq.current) setNotes(payload)
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load report notes')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [domainId, days, includeInfo])
-
-  useEffect(() => {
-    void loadNotes()
-  }, [loadNotes])
+  const loader = useLoader(
+    useCallback(
+      () =>
+        fetchJson<ReportNotes>(
+          `/api/v1/analytics/domains/${domainId}/report-notes?days=${days}&includeInfo=${includeInfo}`,
+        ),
+      [domainId, days, includeInfo],
+    ),
+  )
+  const notes = loader.data ?? null
+  const busy = loader.loading
+  const error = loadErrorMessage(loader.error, 'Failed to load report notes')
 
   // Nothing while the first load is in flight, and nothing when there is nothing to say.
   // The toggle lives inside the card, so once shown the card stays through a reload.
@@ -1319,7 +1352,7 @@ function ReportNotesCard({ domainId, days }: { domainId: string; days: Analytics
         }
       />
       {error ? (
-        <p className="mt-4 rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <p className="mt-4 rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </p>
       ) : notes ? (
@@ -1334,32 +1367,16 @@ function ReportNotesCard({ domainId, days }: { domainId: string; days: Analytics
 }
 
 function TlsReportingCard({ domainId, days }: { domainId: string; days: AnalyticsDays }) {
-  const [summary, setSummary] = useState<TlsRptSummary | null>(null)
-  const [busy, setBusy] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const requestSeq = useRef(0)
-
-  const load = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
-      const payload = await fetchJson<TlsRptSummary>(
-        `/api/v1/analytics/domains/${domainId}/tls-rpt?days=${days}`,
-      )
-      if (seq === requestSeq.current) setSummary(payload)
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load TLS reporting')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [domainId, days])
-
-  useEffect(() => {
-    void load()
-  }, [load])
+  const loader = useLoader(
+    useCallback(
+      () =>
+        fetchJson<TlsRptSummary>(`/api/v1/analytics/domains/${domainId}/tls-rpt?days=${days}`),
+      [domainId, days],
+    ),
+  )
+  const summary = loader.data ?? null
+  const busy = loader.loading
+  const error = loadErrorMessage(loader.error, 'Failed to load TLS reporting')
 
   return (
     <Card pad>
@@ -1373,7 +1390,7 @@ function TlsReportingCard({ domainId, days }: { domainId: string; days: Analytic
           Looking up the TLS-RPT record…
         </div>
       ) : error ? (
-        <p className="rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <p className="rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </p>
       ) : summary ? (
@@ -1658,7 +1675,7 @@ function MtaStsPolicyEditor({
             <label className="grid gap-1 text-xs text-secondary">
               mx patterns — one per line{mode === 'none' ? ' (optional for mode none)' : ''}
               <textarea
-                className="min-h-20 rounded-md border border-border bg-surface-card px-3 py-2 font-mono text-[16px] text-body focus-visible:outline-none focus-visible:shadow-[var(--focus-ring)] sm:text-xs"
+                className="min-h-20 rounded-md border border-border bg-surface-card px-3 py-2 font-mono text-[16px] text-body focus-visible:outline-hidden focus-visible:shadow-(--focus-ring) sm:text-xs"
                 value={patternsText}
                 onChange={(e) => setPatternsText(e.target.value)}
                 placeholder={'mx1.example.com\n*.mail.example.com'}
@@ -1784,33 +1801,20 @@ type SourceDetailPanelProps = {
 }
 
 function SourceDetailPanel({ domainId, sourceIp, days }: SourceDetailPanelProps) {
-  const [detail, setDetail] = useState<SourceDetail | null>(null)
-  const [busy, setBusy] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const requestSeq = useRef(0)
-
-  const loadDetail = useCallback(async () => {
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    setDetail(null)
-    try {
-      const payload = await fetchJson<SourceDetail>(
-        `/api/v1/analytics/domains/${domainId}/source-detail?ip=${encodeURIComponent(sourceIp)}&days=${days}`,
-      )
-      if (seq === requestSeq.current) setDetail(payload)
-    } catch (loadError) {
-      if (seq === requestSeq.current) {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load source detail')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [domainId, sourceIp, days])
-
-  useEffect(() => {
-    void loadDetail()
-  }, [loadDetail])
+  const loader = useLoader(
+    useCallback(
+      () =>
+        fetchJson<SourceDetail>(
+          `/api/v1/analytics/domains/${domainId}/source-detail?ip=${encodeURIComponent(sourceIp)}&days=${days}`,
+        ),
+      [domainId, sourceIp, days],
+    ),
+  )
+  const busy = loader.loading
+  // Never the previous source's detail while the next one loads: the panel sits under
+  // a specific row, and another address's breakdown there would read as this one's.
+  const detail = busy ? null : (loader.data ?? null)
+  const error = loadErrorMessage(loader.error, 'Failed to load source detail')
 
   if (busy) {
     return (
@@ -1824,7 +1828,7 @@ function SourceDetailPanel({ domainId, sourceIp, days }: SourceDetailPanelProps)
   if (error) {
     return (
       <div className="px-5 py-4">
-        <p className="rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <p className="rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </p>
       </div>
@@ -2055,7 +2059,7 @@ export function SourceIpCell({
         event.stopPropagation()
         onToggle()
       }}
-      className="inline-flex items-start gap-1.5 rounded-xs text-left font-mono text-xs font-medium text-body transition-colors hover:text-brand focus-visible:shadow-[var(--focus-ring)] focus-visible:outline-none"
+      className="inline-flex items-start gap-1.5 rounded-xs text-left font-mono text-xs font-medium text-body transition-colors hover:text-link focus-visible:shadow-(--focus-ring) focus-visible:outline-hidden"
     >
       <Icon
         name="chevron-right"
@@ -2072,6 +2076,8 @@ export function SourceIpCell({
 // Quarantined and Rejected moved into the expanded row, so 8 remain in the table.
 const SOURCE_COLUMN_COUNT = 8
 
+const NO_SOURCES: DomainSourceAnalytics[] = []
+
 // The reverse-DNS hostname sits on its own row spanning the first four columns
 // (Source IP, Messages, Failed, Compliance) rather than inside the Source IP cell.
 // A 64-character AWS/Outlook hostname is 375px wide and was forcing that one column
@@ -2084,14 +2090,39 @@ export function DomainDetailPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const days = parseAnalyticsDays(searchParams.get('days'))
   const clientParam = searchParams.get('client')
+  // Carried through untouched so the back link lands on the posture view the user
+  // drilled in from; this page never reads it for anything else.
+  const statusParam = searchParams.get('status')
   const selectedSource = searchParams.get('source')
 
-  const [drilldown, setDrilldown] = useState<DomainDrilldown | null>(null)
-  const [guidance, setGuidance] = useState<EnforcementGuidance | null>(null)
-  const [sources, setSources] = useState<DomainSourceAnalytics[]>([])
-  const [busy, setBusy] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [notFound, setNotFound] = useState(false)
+  const loader = useLoader(
+    useMemo(
+      () =>
+        domainId
+          ? async () => {
+              const [drilldown, sources, guidance] = await Promise.all([
+                fetchJson<DomainDrilldown>(
+                  `/api/v1/analytics/domains/${domainId}/drilldown?days=${days}`,
+                ),
+                fetchJson<DomainSourceAnalytics[]>(
+                  `/api/v1/analytics/domains/${domainId}/sources?days=${days}`,
+                ),
+                fetchJson<EnforcementGuidance>(
+                  `/api/v1/analytics/domains/${domainId}/enforcement?days=${days}`,
+                ),
+              ])
+              return { drilldown, sources, guidance }
+            }
+          : null,
+      [domainId, days],
+    ),
+  )
+  const drilldown = loader.data?.drilldown ?? null
+  const guidance = loader.data?.guidance ?? null
+  const sources = loader.data?.sources ?? NO_SOURCES
+  const busy = loader.loading
+  const notFound = loader.error instanceof ApiError && loader.error.status === 404
+  const error = notFound ? null : loadErrorMessage(loader.error, 'Failed to load domain analytics')
   const [sortKey, setSortKey] = useState<SourceSortKey | null>(null)
   const [sortDir, setSortDir] = useState<SortDir>('desc')
 
@@ -2099,43 +2130,6 @@ export function DomainDetailPage() {
   // Reverse-DNS enrichment, resolved per row as it scrolls into view: this table
   // renders every source it has and a real domain reached 1176 of them.
   const { hostnames, observeSource } = useHostnames()
-  const requestSeq = useRef(0)
-
-  const loadData = useCallback(async () => {
-    if (!domainId) return
-    const seq = ++requestSeq.current
-    setBusy(true)
-    setError(null)
-    try {
-      const [drilldownData, sourceData, guidanceData] = await Promise.all([
-        fetchJson<DomainDrilldown>(`/api/v1/analytics/domains/${domainId}/drilldown?days=${days}`),
-        fetchJson<DomainSourceAnalytics[]>(
-          `/api/v1/analytics/domains/${domainId}/sources?days=${days}`,
-        ),
-        fetchJson<EnforcementGuidance>(
-          `/api/v1/analytics/domains/${domainId}/enforcement?days=${days}`,
-        ),
-      ])
-      if (seq !== requestSeq.current) return
-      setDrilldown(drilldownData)
-      setSources(sourceData)
-      setGuidance(guidanceData)
-      setNotFound(false)
-    } catch (loadError) {
-      if (seq !== requestSeq.current) return
-      if (loadError instanceof ApiError && loadError.status === 404) {
-        setNotFound(true)
-      } else {
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load domain analytics')
-      }
-    } finally {
-      if (seq === requestSeq.current) setBusy(false)
-    }
-  }, [domainId, days])
-
-  useEffect(() => {
-    void loadData()
-  }, [loadData])
 
   // When a source is selected (e.g. by clicking a blocking IP in the
   // enforcement card), bring its row into view — the sources table can be far
@@ -2151,9 +2145,10 @@ export function DomainDetailPage() {
     const params = new URLSearchParams()
     if (days !== 30) params.set('days', String(days))
     if (clientParam) params.set('client', clientParam)
+    if (statusParam) params.set('status', statusParam)
     const query = params.toString()
     return query ? `/domains?${query}` : '/domains'
-  }, [days, clientParam])
+  }, [days, clientParam, statusParam])
 
   const setDays = (next: AnalyticsDays) => {
     setSearchParams(
@@ -2231,6 +2226,12 @@ export function DomainDetailPage() {
   const enfMeta = enforcement ? ENFORCEMENT_STATUS_META[enforcement] : null
   const alignment = domain ? alignmentSummary(domain) : null
 
+  // Every tile below distinguishes "no mail reported" from "all of it failed", so
+  // the condition is named once rather than re-derived per tile.
+  const noReportedMail = !totals || totals.messages === 0
+  const dispositionSegments = dispositionBreakdown(totals)
+  const alignmentCarrier = describeAlignmentCarrier(totals)
+
   const subtitleParts: string[] = []
   if (domain && domain.clientSlug !== 'default') subtitleParts.push(domain.clientName)
   if (drilldown) {
@@ -2246,7 +2247,7 @@ export function DomainDetailPage() {
       <div className="mb-5">
         <Link
           to={backHref}
-          className="inline-flex items-center gap-1.5 text-sm text-secondary transition-colors hover:text-brand"
+          className="inline-flex items-center gap-1.5 text-sm text-secondary transition-colors hover:text-link"
         >
           <Icon name="chevron-left" size={14} />
           Domains
@@ -2287,7 +2288,7 @@ export function DomainDetailPage() {
       </div>
 
       {error ? (
-        <div className="mb-3.5 rounded-md border border-[var(--status-danger-bg)] bg-[var(--status-danger-bg)] px-3 py-2 text-sm text-[var(--status-danger-fg)]">
+        <div className="mb-3.5 rounded-md border border-(--status-danger-bg) bg-(--status-danger-bg) px-3 py-2 text-sm text-(--status-danger-fg)">
           {error}
         </div>
       ) : null}
@@ -2300,34 +2301,101 @@ export function DomainDetailPage() {
 
       {drilldown && totals && domain ? (
         <div className={cn('space-y-3.5 transition-opacity', busy && 'opacity-60')}>
-          <div className="grid grid-cols-2 gap-3.5 xl:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard
               label="Compliance"
-              value={totals.status === 'no_data' ? '—' : formatPercent(totals.complianceRate)}
-            />
-            <StatCard label={`Messages ${days}d`} value={formatCompact(totals.messages)} />
-            <StatCard label="DKIM pass rate" value={formatPercent(totals.dkimPassRate)} />
-            <StatCard label="SPF pass rate" value={formatPercent(totals.spfPassRate)} />
+              value={noReportedMail ? '—' : formatPercent(totals.complianceRate)}
+            >
+              {noReportedMail ? (
+                <p className="text-xs text-secondary">No reports in this window.</p>
+              ) : (
+                <>
+                  <ComplianceSplitBar
+                    compliant={totals.compliantMessages}
+                    messages={totals.messages}
+                  />
+                  <p className="mt-1.5 text-xs text-secondary">
+                    {formatCompact(totals.compliantMessages)} of {formatCompact(totals.messages)}{' '}
+                    messages aligned
+                  </p>
+                </>
+              )}
+            </StatCard>
+
+            {/* DKIM and SPF share a tile because DMARC reads them together: a
+                message passes when *either* aligns, so the two rates only mean
+                something side by side. The headline names the mechanism actually
+                carrying that alignment, which is what decides how much a
+                forwarding path costs this domain. */}
+            <StatCard
+              label="Alignment"
+              value={noReportedMail ? '—' : formatPercent(alignmentCarrier.rate)}
+              extra={noReportedMail ? undefined : alignmentCarrier.label}
+            >
+              <div className="flex flex-col gap-1">
+                <MiniMeter
+                  label="DKIM"
+                  value={noReportedMail ? null : totals.dkimPassRate}
+                  width={64}
+                  title="Share of reported mail that passed DKIM alignment"
+                />
+                <MiniMeter
+                  label="SPF"
+                  value={noReportedMail ? null : totals.spfPassRate}
+                  width={64}
+                  title="Share of reported mail that passed SPF alignment"
+                />
+              </div>
+            </StatCard>
+
+            <StatCard label="Disposition" value={formatCompact(totals.messages)} extra="messages">
+              {noReportedMail ? (
+                <p className="text-xs text-secondary">Nothing reported to dispose of.</p>
+              ) : (
+                <>
+                  {/* No explicit total: the segments already sum to the window's
+                      messages in the normal case, and when overlapping reporters
+                      push quarantine + reject past it, dividing by the sum keeps
+                      the proportions right instead of overflowing the track. */}
+                  <SegmentBar
+                    segments={dispositionSegments}
+                    height={8}
+                    label={`Dispositions: ${describeSegments(dispositionSegments)}`}
+                  />
+                  <p className="mt-1.5 text-xs text-secondary">
+                    {describeSegments(dispositionSegments)}
+                  </p>
+                </>
+              )}
+            </StatCard>
+
+            {/* Divided by the window the server actually returned, not by the
+                requested `days` — the window anchors to the newest report, so a
+                7-day request against five days of data would otherwise understate
+                the average by two days' worth. */}
+            <StatCard
+              label="Daily average"
+              value={formatCompact(
+                Math.round(totals.messages / Math.max(1, drilldown.window.days)),
+              )}
+              extra="per day"
+            >
+              <p className="text-xs text-secondary">
+                over {drilldown.window.days} days, from {totals.reports.toLocaleString('en-US')}{' '}
+                {totals.reports === 1 ? 'report' : 'reports'}
+              </p>
+            </StatCard>
           </div>
 
-          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-3">
+          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
             <StatCard label="Sending sources" value={totals.sources.toLocaleString('en-US')} />
             <StatCard label="Reporters" value={totals.reporters.toLocaleString('en-US')} />
-            <StatCard
-              label="Quarantined + rejected"
-              value={formatCompact(totals.quarantined + totals.rejected)}
-              extra={
-                totals.quarantined + totals.rejected > 0 ? (
-                  <Badge variant="danger">blocked</Badge>
-                ) : undefined
-              }
-            />
           </div>
 
           <div className="grid grid-cols-1 items-start gap-3.5 lg:grid-cols-[1.6fr_1fr]">
             <Card pad>
               <CardHeader title="Message volume" description="Daily messages, compliant vs failed" />
-              <TrendChart data={trendData(drilldown.trend)} height={170} />
+              <TrendChart data={trendData(drilldown.trend)} height={170} legend />
             </Card>
 
             <Card pad>
@@ -2340,8 +2408,8 @@ export function DomainDetailPage() {
                   className={cn(
                     'mb-3.5 rounded-md border px-3 py-2.5',
                     guidance.readyToAdvance
-                      ? 'border-[var(--status-ok-bg)] bg-[var(--status-ok-bg)]'
-                      : 'border-[var(--status-warn-bg)] bg-[var(--status-warn-bg)]',
+                      ? 'border-(--status-ok-bg) bg-(--status-ok-bg)'
+                      : 'border-(--status-warn-bg) bg-(--status-warn-bg)',
                   )}
                 >
                   <div className="flex items-start gap-2">
@@ -2356,15 +2424,28 @@ export function DomainDetailPage() {
                         className={cn(
                           'text-sm font-semibold',
                           guidance.readyToAdvance
-                            ? 'text-[var(--status-ok-fg)]'
-                            : 'text-[var(--status-warn-fg)]',
+                            ? 'text-(--status-ok-fg)'
+                            : 'text-(--status-warn-fg)',
                         )}
                       >
                         {guidance.recommendedAction}
                       </div>
                       <p className="mt-0.5 text-xs leading-relaxed text-secondary">{guidance.rationale}</p>
+                      <p className="mt-1 text-xs leading-relaxed text-secondary">
+                        {enforcementEvidenceLine(guidance.evidence)}
+                      </p>
                     </div>
                   </div>
+                  <EnforcementStepRecord
+                    change={guidance.recordChange}
+                    // A step that changes a tag but produced no record means the live
+                    // record could not be read — worth saying, rather than leaving the
+                    // operator to wonder where the copy button went.
+                    unavailable={
+                      guidance.recommendedPolicy !== guidance.currentPolicy ||
+                      guidance.recommendedTesting !== guidance.currentTesting
+                    }
+                  />
                   {!guidance.readyToAdvance && guidance.blockingSources.length > 0 ? (
                     <ul className="mt-2.5 space-y-1 border-t border-[color-mix(in_srgb,currentColor_12%,transparent)] pt-2">
                       {guidance.blockingSources.slice(0, 5).map((source) => (
@@ -2373,7 +2454,7 @@ export function DomainDetailPage() {
                             <button
                               type="button"
                               onClick={() => toggleSource(source.sourceIp)}
-                              className="min-w-0 break-all text-left font-mono text-xs text-body underline decoration-dotted underline-offset-2 hover:text-brand"
+                              className="min-w-0 break-all text-left font-mono text-xs text-body underline decoration-dotted underline-offset-2 hover:text-link"
                               title="Show this source in the table below"
                             >
                               {source.sourceIp}
@@ -2489,7 +2570,7 @@ export function DomainDetailPage() {
                         // address to look up, so it is left unobserved.
                         ref={attributable ? observeSource(source.sourceIp) : undefined}
                         className={cn(
-                          'border-b border-[var(--gray-100)] transition-colors duration-[120ms] ease-out hover:bg-gray-50',
+                          'border-b border-(--gray-100) transition-colors duration-120 ease-out hover:bg-gray-50',
                           expanded && 'bg-gray-50',
                         )}
                       >
@@ -2516,7 +2597,7 @@ export function DomainDetailPage() {
                             align="right"
                             className={cn(
                               'tabular-nums',
-                              source.failedMessages > 0 && 'font-medium text-[var(--status-danger-fg)]',
+                              source.failedMessages > 0 && 'font-medium text-(--status-danger-fg)',
                             )}
                           >
                             {formatCompact(source.failedMessages)}
@@ -2567,7 +2648,7 @@ export function DomainDetailPage() {
                               {/* Quarantined and Rejected live here rather than as columns:
                                   the two of them cost 216px of table width, which is what
                                   kept this table wider than its container. */}
-                              <dl className="flex gap-6 border-b border-[var(--gray-100)] px-4 py-2.5 text-xs">
+                              <dl className="flex gap-6 border-b border-(--gray-100) px-4 py-2.5 text-xs">
                                 <div className="flex gap-1.5">
                                   <dt className="text-secondary">Quarantined</dt>
                                   <dd className="tabular-nums text-body">{formatCompact(source.quarantined)}</dd>
